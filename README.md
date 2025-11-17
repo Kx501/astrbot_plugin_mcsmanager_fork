@@ -1,0 +1,2 @@
+# astrbot_plugin_mcsmanager
+一个可以管理mcsm的插件
