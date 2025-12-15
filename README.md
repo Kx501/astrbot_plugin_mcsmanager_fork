@@ -10,6 +10,8 @@ _✨ AstrBot 一个可以管理mcsm的小插件 ✨_
 
 </div>
 
+> 您的支持是我的最大动力，点个star不迷路！
+
 ## 介绍
 主要功能:
 - 通过指令开/关mcsm实例
@@ -33,7 +35,7 @@ git clone https://github.com/your-repo/permission-manager.git
 ## 使用说明
 ### 插件配置：
 <img width="1866" height="893" alt="image" src="https://github.com/user-attachments/assets/a79bdc26-c081-4994-9d62-5656d6493cce" />
-所有可选框均为必填配置
+所有可选框均为必填配置！
 MCSManager 面板地址 (mcsm_url)需要填mcsmWeb地址（默认为23333）
 APIkey需要从
 <img width="1867" height="895" alt="屏幕截图 2025-11-17 175417" src="https://github.com/user-attachments/assets/786c3495-efad-4938-8506-ddf3f23296fb" />
@@ -48,7 +50,7 @@ APIkey需要从
 - 启动实例 mcsm start
 - 停止实例 mcsm stop
 - 发送命令 mcsm cmd
-- 查看面板状态 mcsmstatus
+- 查看面板状态 mcsm status
 
 ## 🔗 相关链接
 
