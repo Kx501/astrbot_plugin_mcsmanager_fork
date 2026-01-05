@@ -153,9 +153,33 @@ class MCSMPlugin(Star):
 
     def is_admin_or_authorized(self, event: AstrMessageEvent) -> bool:
         """检查用户权限"""
+        # 管理员始终有权限
         if event.is_admin():
             return True
-        return str(event.get_sender_id()) in self.config.get("authorized_users", [])
+        
+        # 获取配置的授权列表
+        authorized_groups = self.config.get("authorized_groups", [])
+        authorized_users = self.config.get("authorized_users", [])
+        
+        # 如果两个列表都为空，默认所有人有权限
+        if not authorized_groups and not authorized_users:
+            return True
+        
+        # 白名单模式：先检查群组，再检查用户
+        # 检查群组（如果配置了群组列表）
+        if authorized_groups:
+            group_id = event.message_obj.group_id if hasattr(event, 'message_obj') and hasattr(event.message_obj, 'group_id') else ""
+            if group_id and group_id in authorized_groups:
+                return True
+        
+        # 检查用户（如果配置了用户列表）
+        if authorized_users:
+            user_id = str(event.get_sender_id())
+            if user_id in authorized_users:
+                return True
+        
+        # 都不满足，拒绝访问
+        return False
 
     def _get_instance_by_identifier(self, identifier: str) -> Optional[Tuple[str, str]]:
         """
@@ -286,15 +310,23 @@ class MCSMPlugin(Star):
             )
             return
 
-        all_instances: List[Dict[str, Any]] = []
+        # 按节点分组存储实例
+        instances_by_node: Dict[str, List[Dict[str, Any]]] = {}
         node_details: Dict[str, Dict[str, str]] = {} # To store node info for the final list
 
-        # 1. 收集所有实例
+        # 获取要排除的节点列表
+        filtered_nodes = self.config.get("filtered_nodes", [])
+
+        # 1. 收集所有实例，按节点分组
         for node in nodes:
             node_uuid = node.get("uuid")
+            # 如果节点在排除列表中，跳过该节点
+            if node_uuid in filtered_nodes:
+                continue
             node_name = node.get("remarks") or node.get("ip") or "Unnamed Node"
             
             node_details[node_uuid] = {"name": node_name}
+            instances_by_node[node_uuid] = []
 
             # 兼容 v10 API，查询指定节点下的实例
             instances_resp = await self.make_mcsm_request(
@@ -317,15 +349,17 @@ class MCSMPlugin(Star):
                 if status_code is None and "info" in instance:
                     status_code = instance["info"].get("status")
                 
-                all_instances.append({
+                instances_by_node[node_uuid].append({
                     "name": inst_name,
                     "uuid": inst_uuid,
                     "daemon_id": node_uuid,
                     "status": status_code,
                 })
         
-        # 2. A-Z 排序
-        all_instances.sort(key=lambda x: x['name'])
+        # 2. 收集所有实例用于重名检测（跨节点检测）
+        all_instances: List[Dict[str, Any]] = []
+        for node_uuid, instances in instances_by_node.items():
+            all_instances.extend(instances)
         
         # 3. 预处理: 找出重名实例
         name_counts: Dict[str, int] = {}
@@ -344,46 +378,53 @@ class MCSMPlugin(Star):
         result = "🖥️ MCSM 实例列表:\n"
         
         current_index = 1
-        last_daemon_id = None
         
         # v10 状态码: -1:未知, 0:停止, 1:停止中, 2:启动中, 3:运行中喵
         status_map = {3: "🟢", 0: "🔴", 1: "🟠", 2: "🟡", -1: "⚪"}
 
-        for instance in all_instances:
-            inst_name = instance['name']
-            inst_uuid = instance['uuid']
-            daemon_id = instance['daemon_id']
-            status_icon = status_map.get(instance['status'], "⚪")
-            is_ambiguous = inst_name in ambiguous_names # 检查是否重名
-
-            # 打印节点分隔符
-            if daemon_id != last_daemon_id:
-                node_name = node_details.get(daemon_id, {}).get("name", "未知节点")
-                result += f"\n📂 节点: {node_name}\n"
-                result += f"Daemon ID: {daemon_id}\n"
-                last_daemon_id = daemon_id
-
-            # 打印实例信息 (带编号)
-            ambiguity_tag = " (⚠️重名)" if is_ambiguous else "" # 添加重名标记
-            result += f"[{current_index}] {status_icon} {inst_name}{ambiguity_tag}\n"
+        # 按节点遍历显示
+        for node_uuid, instances in instances_by_node.items():
+            if not instances:
+                continue
             
-            # 构建缓存数据
-            instance_data = {
-                "index": str(current_index),
-                "name": inst_name,
-                "uuid": inst_uuid,
-                "daemon_id": daemon_id,
-                "status": instance['status']
-            }
+            # 显示节点信息
+            node_name = node_details.get(node_uuid, {}).get("name", "未知节点")
+            result += f"\n📂 节点: {node_name}\n"
+            result += f"Daemon ID: {node_uuid}\n"
             
-            self.instance_data["instances"].append(instance_data)
-            self.instance_data["uuid_to_id"][inst_uuid] = (daemon_id, inst_uuid)
+            # 节点内按名称排序
+            instances.sort(key=lambda x: x['name'])
             
-            # 只有唯一名称才加入 name_to_id，重名名称不加入喵
-            if not is_ambiguous:
-                self.instance_data["name_to_id"][inst_name] = (daemon_id, inst_uuid)
-            
-            current_index += 1
+            # 显示该节点下的所有实例
+            for instance in instances:
+                inst_name = instance['name']
+                inst_uuid = instance['uuid']
+                status_icon = status_map.get(instance['status'], "⚪")
+                is_ambiguous = inst_name in ambiguous_names # 检查是否重名
+                
+                # 打印实例信息：状态图标 + 实例名称
+                ambiguity_tag = " (⚠️重名)" if is_ambiguous else "" # 添加重名标记
+                result += f"{status_icon} {inst_name}{ambiguity_tag}\n"
+                # UUID单独一行显示，用缩进表示层级
+                result += f"- {inst_uuid}\n"
+                
+                # 构建缓存数据
+                instance_data = {
+                    "index": str(current_index),
+                    "name": inst_name,
+                    "uuid": inst_uuid,
+                    "daemon_id": node_uuid,
+                    "status": instance['status']
+                }
+                
+                self.instance_data["instances"].append(instance_data)
+                self.instance_data["uuid_to_id"][inst_uuid] = (node_uuid, inst_uuid)
+                
+                # 只有唯一名称才加入 name_to_id，重名名称不加入喵
+                if not is_ambiguous:
+                    self.instance_data["name_to_id"][inst_name] = (node_uuid, inst_uuid)
+                
+                current_index += 1
         
         if not all_instances:
              result += "\n(此面板下暂无实例)\n"

@@ -14,7 +14,19 @@
   "authorized_users": {
     "description": "授权用户列表（uid）",
     "type": "list",
-    "hint": "被授权使用命令的用户ID列表",
+    "hint": "不配置时默认所有人有权限，配置后只有列表中的用户可以使用（白名单模式）",
+    "default": []
+  },
+  "authorized_groups": {
+    "description": "授权群组列表",
+    "type": "list",
+    "hint": "不配置时默认所有人有权限，配置后只有列表中的群组可以使用（白名单模式）",
+    "default": []
+  },
+  "filtered_nodes": {
+    "description": "要排除的节点UUID列表",
+    "type": "list",
+    "hint": "在使用mcsm list指令时排除这些节点",
     "default": []
   },
   "log_size": {
@@ -24,4 +36,3 @@
     "default": 20
   }
 }
-

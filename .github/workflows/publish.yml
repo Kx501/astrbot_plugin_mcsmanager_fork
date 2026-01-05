@@ -1,0 +1,53 @@
+# .github/workflows/publish.yml
+name: Publish to Plugin Hub
+
+on:
+  push:
+    tags:
+      - "v*" # 发布版本时触发
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Read metadata.yaml
+        id: read_metadata
+        run: |
+          # 读取metadata.yaml文件
+          if [ -f "metadata.yaml" ]; then
+            echo "Found metadata.yaml"
+            # 读取并转换为JSON格式便于传输
+            METADATA_JSON=$(python3 -c "import yaml, json, sys; data = yaml.safe_load(open('metadata.yaml', 'r')); print(json.dumps(data))")
+          else
+            echo "metadata.yaml not found, please add it before publishing."
+            exit 1
+          fi
+
+          echo "metadata_json<<EOF" >> $GITHUB_ENV
+          echo "$METADATA_JSON" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Send to Plugin Hub
+        env:
+          HUB_TOKEN: ${{ secrets.HUB_PUSH_TOKEN }}
+          METADATA_JSON: ${{ env.metadata_json }}
+        run: |
+          # 构建 repository_dispatch 请求体
+          DISPATCH_BODY=$(python3 -c "import json, os; metadata = json.loads(os.environ.get('METADATA_JSON', '{}')); payload = {'event_type': 'plugin_update', 'client_payload': metadata}; print(json.dumps(payload))")
+
+          # 触发插件中心的 repository_dispatch 事件
+          curl -X POST \
+            -H "Authorization: token $HUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/repos/Kx501/astrbot-hubs/dispatches \
+            -d "$DISPATCH_BODY"
+
+          echo "✅ Plugin metadata sent to hub"
