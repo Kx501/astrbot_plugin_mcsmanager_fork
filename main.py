@@ -65,6 +65,8 @@ class MCSMPlugin(Star):
             "uuid_to_id": {}, # UUID -> (daemon_id, uuid) 映射
             "ambiguous_names": set(), # 存储所有重名实例的名称
         }
+        # 创建后台任务自动刷新缓存（只执行一次）
+        asyncio.create_task(self._refresh_instance_cache_async())
         logger.info("MCSM插件(v10)初始化完成喵~出现问题及时提issue！")
 
     async def terminate(self):
@@ -197,13 +199,149 @@ class MCSMPlugin(Star):
                 return False  # 包含关键词，应该保留
         return True  # 不包含任何关键词，应该过滤
 
+    def _is_uuid_format(self, identifier: str) -> bool:
+        """判断是否为UUID格式（32位十六进制，可能包含连字符）"""
+        # 去除连字符
+        cleaned = identifier.replace('-', '')
+        # 检查长度和字符集
+        return len(cleaned) == 32 and all(c in '0123456789abcdefABCDEF' for c in cleaned)
+
+    def _detect_identifier_type(self, identifier: str) -> str:
+        """检测标识符类型：'number', 'uuid', 'name'"""
+        if identifier.isdigit():
+            return 'number'
+        if self._is_uuid_format(identifier):
+            return 'uuid'
+        return 'name'
+
+    async def _refresh_instance_cache_async(self) -> bool:
+        """
+        自动刷新实例缓存，不显示结果给用户
+        返回True表示成功，False表示失败
+        """
+        try:
+            overview_resp = await self.make_mcsm_request("/overview")
+            
+            nodes: List[Dict[str, Any]] = []
+            if overview_resp.get("status") == 200:
+                nodes = overview_resp.get("data", {}).get("remote", [])
+            
+            if not nodes:
+                logger.warning("自动刷新缓存失败: 无法从 /overview 获取节点信息")
+                return False
+
+            # 按节点分组存储实例
+            instances_by_node: Dict[str, List[Dict[str, Any]]] = {}
+            
+            # 获取要排除的节点列表
+            filtered_nodes = self.config.get("filtered_nodes", [])
+
+            # 1. 收集所有实例，按节点分组
+            for node in nodes:
+                node_uuid = node.get("uuid")
+                # 如果节点在排除列表中，跳过该节点
+                if node_uuid in filtered_nodes:
+                    continue
+                
+                instances_by_node[node_uuid] = []
+
+                # 兼容 v10 API，查询指定节点下的实例
+                instances_resp = await self.make_mcsm_request(
+                    "/service/remote_service_instances",
+                    params={"daemonId": node_uuid, "page": 1, "page_size": 100}
+                )
+
+                if instances_resp.get("status") != 200:
+                    continue
+
+                data_block = instances_resp.get("data", {})
+                # 兼容 API 返回数据结构不一致的情况
+                instances = data_block.get("data", []) if isinstance(data_block, dict) else data_block
+                
+                for instance in instances:
+                    inst_name = instance.get("config", {}).get("nickname") or "未命名"
+                    # 检查是否应该过滤该实例
+                    if self._should_filter_instance(inst_name):
+                        continue
+                    
+                    inst_uuid = instance.get("instanceUuid")
+                    status_code = instance.get("status")
+                    if status_code is None and "info" in instance:
+                        status_code = instance["info"].get("status")
+                    
+                    instances_by_node[node_uuid].append({
+                        "name": inst_name,
+                        "uuid": inst_uuid,
+                        "daemon_id": node_uuid,
+                        "status": status_code,
+                    })
+            
+            # 2. 收集所有实例用于重名检测（跨节点检测）
+            all_instances: List[Dict[str, Any]] = []
+            for node_uuid, instances in instances_by_node.items():
+                all_instances.extend(instances)
+            
+            # 3. 预处理: 找出重名实例
+            name_counts: Dict[str, int] = {}
+            for instance in all_instances:
+                name = instance['name']
+                name_counts[name] = name_counts.get(name, 0) + 1
+
+            ambiguous_names: Set[str] = {name for name, count in name_counts.items() if count > 1}
+
+            # 4. 构建缓存（不生成显示文本）
+            self.instance_data["instances"] = []
+            self.instance_data["name_to_id"] = {}
+            self.instance_data["uuid_to_id"] = {}
+            self.instance_data["ambiguous_names"] = ambiguous_names
+            
+            current_index = 1
+
+            # 按节点遍历构建缓存
+            for node_uuid, instances in instances_by_node.items():
+                if not instances:
+                    continue
+                
+                # 节点内按名称排序
+                instances.sort(key=lambda x: x['name'])
+                
+                # 构建缓存数据
+                for instance in instances:
+                    inst_name = instance['name']
+                    inst_uuid = instance['uuid']
+                    is_ambiguous = inst_name in ambiguous_names
+                    
+                    instance_data = {
+                        "index": str(current_index),
+                        "name": inst_name,
+                        "uuid": inst_uuid,
+                        "daemon_id": node_uuid,
+                        "status": instance['status']
+                    }
+                    
+                    self.instance_data["instances"].append(instance_data)
+                    self.instance_data["uuid_to_id"][inst_uuid] = (node_uuid, inst_uuid)
+                    
+                    # 只有唯一名称才加入 name_to_id，重名名称不加入
+                    if not is_ambiguous:
+                        self.instance_data["name_to_id"][inst_name] = (node_uuid, inst_uuid)
+                    
+                    current_index += 1
+            
+            logger.info(f"MCSM插件: 自动刷新缓存完成，共 {len(all_instances)} 个实例")
+            return True
+        except Exception as e:
+            logger.error(f"MCSM插件: 自动刷新缓存失败: {str(e)}")
+            return False
+
     def _get_instance_by_identifier(self, identifier: str) -> Optional[Tuple[str, str]]:
         """
         通过实例名、索引或 UUID 查找对应的 (daemonId, instanceUuid)。
+        查找优先级：纯数字=编号，32位十六进制=UUID，其他=名称
         """
         identifier = identifier.strip()
         
-        # 1. 尝试通过索引查找 (数字)
+        # 1. 纯数字 → 作为编号处理
         if identifier.isdigit():
             index = int(identifier)
             instances = self.instance_data.get("instances", [])
@@ -214,9 +352,24 @@ class MCSMPlugin(Star):
                 if self._should_filter_instance(instance_data['name']):
                     return None
                 return instance_data['daemon_id'], instance_data['uuid']
+            # 超出范围，返回None（不再尝试作为名称）
+            return None
         
-        # 2. 尝试通过名称或 UUID 查找 (字符串)
+        # 2. 32位十六进制字符串 → 作为 UUID 查找
+        if self._is_uuid_format(identifier):
+            if identifier in self.instance_data["uuid_to_id"]:
+                daemon_id, instance_uuid = self.instance_data["uuid_to_id"][identifier]
+                # 从缓存中查找实例名称
+                for inst_data in self.instance_data.get("instances", []):
+                    if inst_data['uuid'] == instance_uuid:
+                        if self._should_filter_instance(inst_data['name']):
+                            return None
+                        break
+                return daemon_id, instance_uuid
+            # UUID格式但找不到，返回None
+            return None
         
+        # 3. 其他字符串 → 作为名称查找
         # 检查是否是重名实例，如果是，则不允许通过名称操作
         if identifier in self.instance_data.get("ambiguous_names", set()):
             logger.warning(f"用户尝试通过重名实例名称操作: {identifier}。已拒绝。")
@@ -228,19 +381,152 @@ class MCSMPlugin(Star):
             if self._should_filter_instance(instance_name):
                 return None
             return self.instance_data["name_to_id"][identifier]
-        
-        if identifier in self.instance_data["uuid_to_id"]:
-            # 通过UUID查找时，需要检查实例名称是否应该被过滤
-            daemon_id, instance_uuid = self.instance_data["uuid_to_id"][identifier]
-            # 从缓存中查找实例名称
-            for inst_data in self.instance_data.get("instances", []):
-                if inst_data['uuid'] == instance_uuid:
-                    if self._should_filter_instance(inst_data['name']):
-                        return None
-                    break
-            return daemon_id, instance_uuid
 
         return None
+
+    def _collect_instances_for_batch(
+        self,
+        identifiers: List[str]
+    ) -> Tuple[Optional[List[Tuple[str, str, str, str]]], Optional[List[str]]]:
+        """
+        收集批量操作的实例
+        返回：(成功收集的实例列表, 失败的标识符列表) 或 (None, None) 表示类型不一致
+        实例格式：(ident, daemon_id, instance_id, instance_name)
+        """
+        # 过滤空字符串
+        identifiers = [ident.strip() for ident in identifiers if ident.strip()]
+        if not identifiers:
+            return [], []
+        
+        # 统一类型检查
+        first_type = self._detect_identifier_type(identifiers[0])
+        for ident in identifiers:
+            if self._detect_identifier_type(ident) != first_type:
+                return None, None  # 类型不一致，返回特殊值
+        
+        # 收集实例
+        instances = []
+        failed_identifiers = []
+        
+        for ident in identifiers:
+            ids = self._get_instance_by_identifier(ident)
+            if ids:
+                daemon_id, instance_id = ids
+                # 获取实例名称
+                instance_name = ident
+                for data in self.instance_data.get("instances", []):
+                    if data['uuid'] == instance_id:
+                        instance_name = data['name']
+                        break
+                instances.append((ident, daemon_id, instance_id, instance_name))
+            else:
+                failed_identifiers.append(ident)
+        
+        return instances, failed_identifiers
+
+    async def _process_batch_operation(
+        self,
+        event: AstrMessageEvent,
+        instances: List[Tuple[str, str, str, str]],  # (ident, daemon_id, instance_id, instance_name)
+        operation_emoji: str,  # "🚀" 或 "🛑"
+        operation_name: str,  # "启动" 或 "停止"
+        api_endpoint: str,  # "/protected_instance/open" 或 "/protected_instance/stop"
+        failed_identifiers: List[str]
+    ):
+        """批量操作的通用处理逻辑"""
+        # 显示开始信息
+        yield event.plain_result(f"{operation_emoji} 开始批量{operation_name} {len(instances)} 个实例...")
+        await asyncio.sleep(2)
+        
+        success_count = 0
+        fail_count = 0
+        fail_details = []
+        
+        for ident, daemon_id, instance_id, instance_name in instances:
+            # 检查冷却
+            if self.cooldown_manager.check_cooldown(instance_id):
+                yield event.plain_result(f"⏳ {instance_name} 操作太快了，跳过")
+                await asyncio.sleep(2)
+                fail_count += 1
+                fail_details.append(f"{instance_name}: 操作太快")
+                continue
+            
+            yield event.plain_result(f"{operation_emoji} 正在{operation_name}: {instance_name} ...")
+            await asyncio.sleep(2)
+            
+            resp = await self.make_mcsm_request(
+                api_endpoint,
+                method="GET",
+                params={"uuid": instance_id, "daemonId": daemon_id}
+            )
+            
+            if resp.get("status") != 200:
+                err = resp.get("data") or resp.get("error") or "未知错误"
+                status_code = resp.get("status", "???")
+                yield event.plain_result(f"❌ {instance_name} {operation_name}失败: [{status_code}] {err}")
+                await asyncio.sleep(2)
+                fail_count += 1
+                fail_details.append(f"{instance_name}: {err}")
+            else:
+                self.cooldown_manager.set_cooldown(instance_id)
+                yield event.plain_result(f"✅ {instance_name} {operation_name}命令已发送")
+                await asyncio.sleep(2)
+                success_count += 1
+        
+        # 汇总结果
+        result_msg = f"📊 批量{operation_name}完成: 成功 {success_count} 个，失败 {fail_count} 个"
+        if failed_identifiers:
+            result_msg += f"\n⚠️ 未找到的标识符: {', '.join(failed_identifiers)}"
+        if fail_details:
+            result_msg += f"\n❌ 失败详情:\n" + "\n".join(fail_details)
+        yield event.plain_result(result_msg)
+
+    async def _process_single_instance(
+        self,
+        event: AstrMessageEvent,
+        identifier: str,
+        operation_emoji: str,  # "🚀" 或 "🛑"
+        operation_name: str,  # "启动" 或 "停止"
+        api_endpoint: str  # "/protected_instance/open" 或 "/protected_instance/stop"
+    ):
+        """单实例操作的通用处理逻辑"""
+        ids = self._get_instance_by_identifier(identifier)
+        if not ids:
+            if identifier in self.instance_data.get("ambiguous_names", set()):
+                yield event.plain_result(f"❌ {operation_name}失败: 实例名称 '{identifier}' 重复。请使用 编号/UUID 进行操作。")
+            else:
+                yield event.plain_result(f"❌ 找不到实例: {identifier}。请确认名称/编号或/UUID正确，并先运行 /mcsm list 更新列表。")
+            return
+        
+        daemon_id, instance_id = ids
+        
+        if self.cooldown_manager.check_cooldown(instance_id):
+            yield event.plain_result("⏳ 操作太快了，请稍后再试")
+            return
+        
+        # 获取实例名称
+        instance_name = identifier
+        for data in self.instance_data.get("instances", []):
+            if data['uuid'] == instance_id:
+                instance_name = data['name']
+                break
+        
+        yield event.plain_result(f"{operation_emoji} 正在{operation_name}: {instance_name} ...")
+        
+        resp = await self.make_mcsm_request(
+            api_endpoint,
+            method="GET",
+            params={"uuid": instance_id, "daemonId": daemon_id}
+        )
+        
+        if resp.get("status") != 200:
+            err = resp.get("data") or resp.get("error") or "未知错误"
+            status_code = resp.get("status", "???")
+            yield event.plain_result(f"❌ {operation_name}失败: [{status_code}] {err}")
+            return
+        
+        self.cooldown_manager.set_cooldown(instance_id)
+        yield event.plain_result(f"✅ {instance_name} {operation_name}命令已发送")
 
     @filter.command("mcsm help")
     async def mcsm_main(self, event: AstrMessageEvent):
@@ -257,8 +543,8 @@ class MCSMPlugin(Star):
 /mcsm list - 节点实例列表 (按名称A-Z排序，提供编号)
 
 > 实例操作 (支持 名称/编号/UUID) ---
-/mcsm start [实例] - 启动实例
-/mcsm stop [实例] - 停止实例
+/mcsm start [实例1] [实例2] - 批量启动（空格分隔，所有标识符必须是同一类型）
+/mcsm stop [实例1] [实例2] - 批量停止（空格分隔，所有标识符必须是同一类型）
 /mcsm cmd [实例] [命令] - 发送命令
 /mcsm log [实例] - 查看最近日志
 
@@ -413,9 +699,10 @@ class MCSMPlugin(Star):
         result = "🖥️ MCSM 实例列表:\n"
         
         current_index = 1
-        
-        # v10 状态码: -1:未知, 0:停止, 1:停止中, 2:启动中, 3:运行中喵
-        status_map = {3: "🟢", 0: "🔴", 1: "🟠", 2: "🟡", -1: "⚪"}
+
+        # v10 状态码: -1:未知, 0:停止, 1:停止中, 2:启动中, 3:运行中
+        # status_map = {3: "🟢", 0: "🔴", 1: "🟠", 2: "🟡", -1: "⚪"}
+        status_map = {3: "✔", 0: "✘", 1: "⚑", 2: "⛟", -1: "☠"}
 
         # 按节点遍历显示
         for node_uuid, instances in instances_by_node.items():
@@ -424,7 +711,7 @@ class MCSMPlugin(Star):
             
             # 显示节点信息
             node_name = node_details.get(node_uuid, {}).get("name", "未知节点")
-            result += f"\n📂 节点: {node_name}\n"
+            result += f"\n⛽ 节点: {node_name}\n"
             result += f"Daemon ID: {node_uuid}\n"
             
             # 节点内按名称排序
@@ -434,12 +721,12 @@ class MCSMPlugin(Star):
             for instance in instances:
                 inst_name = instance['name']
                 inst_uuid = instance['uuid']
-                status_icon = status_map.get(instance['status'], "⚪")
+                status_icon = status_map.get(instance['status'], "☠")
                 is_ambiguous = inst_name in ambiguous_names # 检查是否重名
                 
-                # 打印实例信息：状态图标 + 实例名称
-                ambiguity_tag = " (⚠️重名)" if is_ambiguous else "" # 添加重名标记
-                result += f"{status_icon} {inst_name}{ambiguity_tag}\n"
+                # 打印实例信息：状态图标 + 编号 + 实例名称
+                ambiguity_tag = " (☢重名)" if is_ambiguous else "" # 添加重名标记
+                result += f"{status_icon} [{current_index}] {inst_name}{ambiguity_tag}\n"
                 # UUID单独一行显示，用缩进表示层级
                 result += f"- {inst_uuid}\n"
                 
@@ -466,110 +753,88 @@ class MCSMPlugin(Star):
              
         result += "\n💡 提示: 使用 /mcsm start [名称/编号] 即可操作。"
         if ambiguous_names:
-            result += "\n\n⚠️ 注意: 标记 '⚠️重名' 的实例，请使用编号/UUID 进行操作。"
+            result += "\n\n☢ 注意: 标记 '☢重名' 的实例，请使用编号/UUID 进行操作。"
 
 
         yield event.plain_result(result)
 
     @filter.command("mcsm start")
     async def mcsm_start(self, event: AstrMessageEvent, identifier: str):
-        """启动实例 (支持名称/编号/UUID)"""
+        """启动实例 (支持名称/编号/UUID，支持批量操作)"""
         if not self.is_admin_or_authorized(event):
             yield event.plain_result("❌ 权限不足")
             return
 
-        # Lookup instance by identifier
-        ids = self._get_instance_by_identifier(identifier)
-        if not ids:
-            # 检查是否是重名导致的查找失败
-            if identifier in self.instance_data.get("ambiguous_names", set()):
-                 yield event.plain_result(f"❌ 启动失败: 实例名称 '{identifier}' 重复。重复。请使用 编号/UUID 进行操作。")
-            else:
-                 yield event.plain_result(f"❌ 找不到实例: {identifier}。请确认名称/编号或/UUID正确，并先运行 /mcsm list 更新列表。")
+        # 检测是否为批量操作（包含空格）
+        identifiers = [ident.strip() for ident in identifier.strip().split() if ident.strip()]
+        
+        # 批量操作
+        if len(identifiers) > 1:
+            instances, failed_identifiers = self._collect_instances_for_batch(identifiers)
+            
+            if instances is None:  # 类型不一致
+                yield event.plain_result(f"❌ 批量操作时所有标识符必须是同一类型（编号/UUID/名称），当前混合使用了不同类型")
+                return
+            
+            if not instances:
+                yield event.plain_result(f"❌ 批量启动失败: 所有标识符都找不到对应的实例")
+                return
+            
+            # 使用公共方法处理批量操作
+            async for result in self._process_batch_operation(
+                event, instances, "🚀", "启动", "/protected_instance/open", failed_identifiers
+            ):
+                yield result
             return
         
-        daemon_id, instance_id = ids
-
-        if self.cooldown_manager.check_cooldown(instance_id):
-            yield event.plain_result("⏳ 操作太快了，请稍后再试")
+        # 单实例操作
+        if not identifier.strip():
+            yield event.plain_result("❌ 请输入有效的实例标识符")
             return
-
-        # Fetch instance name for better messaging
-        instance_name = identifier
-        try:
-            for data in self.instance_data.get("instances", []):
-                if data['uuid'] == instance_id:
-                    instance_name = data['name']
-                    break
-        except Exception:
-            pass # Use identifier if lookup fails
-
-        yield event.plain_result(f"🚀 正在启动: {instance_name} ...")
-
-        start_resp = await self.make_mcsm_request(
-            "/protected_instance/open", 
-            method="GET", 
-            params={"uuid": instance_id, "daemonId": daemon_id} 
-        )
         
-        if start_resp.get("status") != 200:
-            err = start_resp.get("data") or start_resp.get("error") or "未知错误"
-            status_code = start_resp.get("status", "???")
-            yield event.plain_result(f"❌ 启动失败: [{status_code}] {err}")
-            return
-
-        self.cooldown_manager.set_cooldown(instance_id)
-        yield event.plain_result(f"✅ {instance_name} 启动命令已发送")
+        async for result in self._process_single_instance(
+            event, identifier.strip(), "🚀", "启动", "/protected_instance/open"
+        ):
+            yield result
 
     @filter.command("mcsm stop")
     async def mcsm_stop(self, event: AstrMessageEvent, identifier: str):
-        """停止实例 (支持名称/编号/UUID)"""
+        """停止实例 (支持名称/编号/UUID，支持批量操作)"""
         if not self.is_admin_or_authorized(event):
             yield event.plain_result("❌ 权限不足")
             return
 
-        # Lookup instance by identifier
-        ids = self._get_instance_by_identifier(identifier)
-        if not ids:
-            # 检查是否是重名导致的查找失败
-            if identifier in self.instance_data.get("ambiguous_names", set()):
-                 yield event.plain_result(f"❌ 停止失败: 实例名称 '{identifier}' 重复。请使用 编号/UUID 进行操作。")
-            else:
-                 yield event.plain_result(f"❌ 找不到实例: {identifier}。请确认名称/编号或/UUID正确，并先运行 /mcsm list 更新列表。")
+        # 检测是否为批量操作（包含空格）
+        identifiers = [ident.strip() for ident in identifier.strip().split() if ident.strip()]
+        
+        # 批量操作
+        if len(identifiers) > 1:
+            instances, failed_identifiers = self._collect_instances_for_batch(identifiers)
+            
+            if instances is None:  # 类型不一致
+                yield event.plain_result(f"❌ 批量操作时所有标识符必须是同一类型（编号/UUID/名称），当前混合使用了不同类型")
+                return
+            
+            if not instances:
+                yield event.plain_result(f"❌ 批量停止失败: 所有标识符都找不到对应的实例")
+                return
+            
+            # 使用公共方法处理批量操作
+            async for result in self._process_batch_operation(
+                event, instances, "🛑", "停止", "/protected_instance/stop", failed_identifiers
+            ):
+                yield result
             return
         
-        daemon_id, instance_id = ids
-
-        if self.cooldown_manager.check_cooldown(instance_id):
-            yield event.plain_result("⏳ 操作太快了，请稍后再试")
+        # 单实例操作
+        if not identifier.strip():
+            yield event.plain_result("❌ 请输入有效的实例标识符")
             return
-
-        # Fetch instance name for better messaging
-        instance_name = identifier
-        try:
-            for data in self.instance_data.get("instances", []):
-                if data['uuid'] == instance_id:
-                    instance_name = data['name']
-                    break
-        except Exception:
-            pass # Use identifier if lookup fails
         
-        yield event.plain_result(f"🛑 正在停止: {instance_name} ...")
-
-        stop_resp = await self.make_mcsm_request(
-            "/protected_instance/stop",
-            method="GET",
-            params={"uuid": instance_id, "daemonId": daemon_id}
-        )
-
-        if stop_resp.get("status") != 200:
-            err = stop_resp.get("data") or stop_resp.get("error") or "未知错误"
-            status_code = stop_resp.get("status", "???")
-            yield event.plain_result(f"❌ 停止失败: [{status_code}] {err}")
-            return
-
-        self.cooldown_manager.set_cooldown(instance_id)
-        yield event.plain_result(f"✅ {instance_name} 停止命令已发送")
+        async for result in self._process_single_instance(
+            event, identifier.strip(), "🛑", "停止", "/protected_instance/stop"
+        ):
+            yield result
 
     @filter.command("mcsm cmd")
     async def mcsm_cmd(self, event: AstrMessageEvent, identifier: str):
