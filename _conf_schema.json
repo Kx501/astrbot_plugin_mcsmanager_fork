@@ -14,13 +14,13 @@
   "authorized_users": {
     "description": "授权用户列表（uid）",
     "type": "list",
-    "hint": "不配置时默认所有人有权限，配置后只有列表中的用户可以使用（白名单模式）",
+    "hint": "配置后只有列表中的用户可以使用（白名单模式），不配置时所有人都有权限",
     "default": []
   },
   "authorized_groups": {
     "description": "授权群组列表",
     "type": "list",
-    "hint": "不配置时默认所有人有权限，配置后只有列表中的群组可以使用（白名单模式）",
+    "hint": "配置后只有列表中的群组可以使用（白名单模式），不配置时所有人都有权限",
     "default": []
   },
   "filtered_nodes": {
@@ -32,7 +32,7 @@
   "filtered_instance_keywords": {
     "description": "用于过滤实例的关键词列表",
     "type": "list",
-    "hint": "实例名称包含任意关键词将被过滤，不会显示在列表中且无法操作",
+    "hint": "只显示包含任意关键词的实例（白名单模式），不配置时显示所有实例",
     "default": []
   },
   "log_size": {

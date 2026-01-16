@@ -184,7 +184,8 @@ class MCSMPlugin(Star):
     def _should_filter_instance(self, instance_name: str) -> bool:
         """
         检查实例名称是否应该被过滤。
-        如果实例名称包含配置中任意关键词，返回 True。
+        如果实例名称不包含配置中任意关键词，返回 True（应该过滤）。
+        如果包含任意关键词，返回 False（应该保留，白名单模式）。
         """
         filtered_keywords = self.config.get("filtered_instance_keywords", [])
         if not filtered_keywords:
@@ -193,8 +194,8 @@ class MCSMPlugin(Star):
         instance_name_lower = instance_name.lower()
         for keyword in filtered_keywords:
             if keyword and keyword.lower() in instance_name_lower:
-                return True
-        return False
+                return False  # 包含关键词，应该保留
+        return True  # 不包含任何关键词，应该过滤
 
     def _get_instance_by_identifier(self, identifier: str) -> Optional[Tuple[str, str]]:
         """
