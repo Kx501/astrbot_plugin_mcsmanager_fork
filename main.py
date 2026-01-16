@@ -181,6 +181,21 @@ class MCSMPlugin(Star):
         # 都不满足，拒绝访问
         return False
 
+    def _should_filter_instance(self, instance_name: str) -> bool:
+        """
+        检查实例名称是否应该被过滤。
+        如果实例名称包含配置中任意关键词，返回 True。
+        """
+        filtered_keywords = self.config.get("filtered_instance_keywords", [])
+        if not filtered_keywords:
+            return False
+        
+        instance_name_lower = instance_name.lower()
+        for keyword in filtered_keywords:
+            if keyword and keyword.lower() in instance_name_lower:
+                return True
+        return False
+
     def _get_instance_by_identifier(self, identifier: str) -> Optional[Tuple[str, str]]:
         """
         通过实例名、索引或 UUID 查找对应的 (daemonId, instanceUuid)。
@@ -194,6 +209,9 @@ class MCSMPlugin(Star):
             # 索引是 1-based, 列表是 0-based
             if 0 < index <= len(instances):
                 instance_data = instances[index - 1]
+                # 检查是否应该过滤该实例
+                if self._should_filter_instance(instance_data['name']):
+                    return None
                 return instance_data['daemon_id'], instance_data['uuid']
         
         # 2. 尝试通过名称或 UUID 查找 (字符串)
@@ -204,10 +222,22 @@ class MCSMPlugin(Star):
             return None
 
         if identifier in self.instance_data["name_to_id"]:
+            # 检查是否应该过滤该实例
+            instance_name = identifier
+            if self._should_filter_instance(instance_name):
+                return None
             return self.instance_data["name_to_id"][identifier]
         
         if identifier in self.instance_data["uuid_to_id"]:
-            return self.instance_data["uuid_to_id"][identifier]
+            # 通过UUID查找时，需要检查实例名称是否应该被过滤
+            daemon_id, instance_uuid = self.instance_data["uuid_to_id"][identifier]
+            # 从缓存中查找实例名称
+            for inst_data in self.instance_data.get("instances", []):
+                if inst_data['uuid'] == instance_uuid:
+                    if self._should_filter_instance(inst_data['name']):
+                        return None
+                    break
+            return daemon_id, instance_uuid
 
         return None
 
@@ -344,6 +374,10 @@ class MCSMPlugin(Star):
             
             for instance in instances:
                 inst_name = instance.get("config", {}).get("nickname") or "未命名"
+                # 检查是否应该过滤该实例
+                if self._should_filter_instance(inst_name):
+                    continue
+                
                 inst_uuid = instance.get("instanceUuid")
                 status_code = instance.get("status")
                 if status_code is None and "info" in instance:

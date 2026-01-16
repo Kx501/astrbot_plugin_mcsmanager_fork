@@ -29,6 +29,12 @@
     "hint": "在使用mcsm list指令时排除这些节点",
     "default": []
   },
+  "filtered_instance_keywords": {
+    "description": "用于过滤实例的关键词列表",
+    "type": "list",
+    "hint": "实例名称包含任意关键词将被过滤，不会显示在列表中且无法操作",
+    "default": []
+  },
   "log_size": {
     "description": "日志获取行数",
     "type": "int",
