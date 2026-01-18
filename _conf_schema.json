@@ -35,6 +35,12 @@
     "hint": "只显示包含任意关键词的实例（白名单模式），不配置时显示所有实例",
     "default": []
   },
+  "batch_operation_interval": {
+    "description": "批量操作间隔时间（秒）",
+    "type": "float",
+    "hint": "批量启动/停止时，每个实例操作之间的等待时间，默认2秒，建议2-5秒",
+    "default": 2.0
+  },
   "log_size": {
     "description": "日志获取行数",
     "type": "int",

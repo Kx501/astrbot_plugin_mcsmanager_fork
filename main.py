@@ -58,6 +58,8 @@ class MCSMPlugin(Star):
         self.config = config
         self.cooldown_manager = InstanceCooldownManager()
         self.http_client = httpx.AsyncClient(timeout=30.0)
+        # 批量操作间隔时间（秒）
+        self.batch_interval = float(self.config.get("batch_operation_interval", 2.0))
         # 缓存实例数据，用于名称/编号/UUID查找
         self.instance_data: Dict[str, Any] = {
             "instances": [], # 实例列表 [{'index': str, 'name': str, 'daemon_id': str, 'uuid': str, 'status': int}, ...]
@@ -765,8 +767,16 @@ class MCSMPlugin(Star):
             yield event.plain_result("❌ 权限不足")
             return
 
-        # 检测是否为批量操作（包含空格）
-        identifiers = [ident.strip() for ident in identifier.strip().split() if ident.strip()]
+        # 从完整消息中提取所有标识符
+        raw_msg = event.message_str.strip()
+        parts = raw_msg.split(maxsplit=2)  # 分割为: ["/mcsm", "start", "2 3"]
+        
+        if len(parts) < 3:
+            # 没有提供标识符，使用 identifier 参数（向后兼容）
+            identifiers = [identifier.strip()] if identifier.strip() else []
+        else:
+            # 提取所有标识符（支持空格分隔的多个标识符）
+            identifiers = [ident.strip() for ident in parts[2].strip().split() if ident.strip()]
         
         # 批量操作
         if len(identifiers) > 1:
@@ -780,20 +790,68 @@ class MCSMPlugin(Star):
                 yield event.plain_result(f"❌ 批量启动失败: 所有标识符都找不到对应的实例")
                 return
             
-            # 使用公共方法处理批量操作
-            async for result in self._process_batch_operation(
-                event, instances, "🚀", "启动", "/protected_instance/open", failed_identifiers
-            ):
-                yield result
+            # 发送开始消息
+            yield event.plain_result(f"🚀 开始批量启动 {len(instances)} 个实例...")
+            await asyncio.sleep(self.batch_interval)
+            
+            # 收集所有操作结果，循环中不 yield
+            success_count = 0
+            fail_count = 0
+            fail_details = []
+            result_messages = []  # 收集所有结果消息
+            
+            for idx, (ident, daemon_id, instance_id, instance_name) in enumerate(instances, 1):
+                # 检查冷却
+                if self.cooldown_manager.check_cooldown(instance_id):
+                    result_messages.append(f"⏳ {instance_name} 操作太快了，跳过")
+                    fail_count += 1
+                    fail_details.append(f"{instance_name}: 操作太快")
+                    await asyncio.sleep(self.batch_interval)  # 保持延迟，但不 yield
+                    continue
+                
+                # 执行 API 请求
+                resp = await self.make_mcsm_request(
+                    "/protected_instance/open",
+                    method="GET",
+                    params={"uuid": instance_id, "daemonId": daemon_id}
+                )
+                
+                if resp.get("status") != 200:
+                    err = resp.get("data") or resp.get("error") or "未知错误"
+                    status_code = resp.get("status", "???")
+                    result_messages.append(f"❌ {instance_name} 启动失败: [{status_code}] {err}")
+                    fail_count += 1
+                    fail_details.append(f"{instance_name}: {err}")
+                else:
+                    self.cooldown_manager.set_cooldown(instance_id)
+                    result_messages.append(f"✅ {instance_name} 启动命令已发送")
+                    success_count += 1
+                
+                # 每个实例处理完后延迟（除了最后一个）
+                if idx < len(instances):
+                    await asyncio.sleep(self.batch_interval)
+            
+            # 循环结束后，一次性发送所有结果
+            # 构建完整的结果消息
+            result_msg = f"📊 批量启动完成: 成功 {success_count} 个，失败 {fail_count} 个\n\n"
+            result_msg += "\n".join(result_messages)
+            
+            if failed_identifiers:
+                result_msg += f"\n\n⚠️ 未找到的标识符: {', '.join(failed_identifiers)}"
+            if fail_details:
+                result_msg += f"\n\n❌ 失败详情:\n" + "\n".join(fail_details)
+            
+            yield event.plain_result(result_msg)
             return
         
         # 单实例操作
-        if not identifier.strip():
+        if not identifiers:
             yield event.plain_result("❌ 请输入有效的实例标识符")
             return
         
+        # 使用第一个标识符（单实例操作）
         async for result in self._process_single_instance(
-            event, identifier.strip(), "🚀", "启动", "/protected_instance/open"
+            event, identifiers[0], "🚀", "启动", "/protected_instance/open"
         ):
             yield result
 
@@ -804,8 +862,16 @@ class MCSMPlugin(Star):
             yield event.plain_result("❌ 权限不足")
             return
 
-        # 检测是否为批量操作（包含空格）
-        identifiers = [ident.strip() for ident in identifier.strip().split() if ident.strip()]
+        # 从完整消息中提取所有标识符
+        raw_msg = event.message_str.strip()
+        parts = raw_msg.split(maxsplit=2)  # 分割为: ["/mcsm", "stop", "2 3"]
+        
+        if len(parts) < 3:
+            # 没有提供标识符，使用 identifier 参数（向后兼容）
+            identifiers = [identifier.strip()] if identifier.strip() else []
+        else:
+            # 提取所有标识符（支持空格分隔的多个标识符）
+            identifiers = [ident.strip() for ident in parts[2].strip().split() if ident.strip()]
         
         # 批量操作
         if len(identifiers) > 1:
@@ -819,20 +885,68 @@ class MCSMPlugin(Star):
                 yield event.plain_result(f"❌ 批量停止失败: 所有标识符都找不到对应的实例")
                 return
             
-            # 使用公共方法处理批量操作
-            async for result in self._process_batch_operation(
-                event, instances, "🛑", "停止", "/protected_instance/stop", failed_identifiers
-            ):
-                yield result
+            # 发送开始消息
+            yield event.plain_result(f"🛑 开始批量停止 {len(instances)} 个实例...")
+            await asyncio.sleep(self.batch_interval)
+            
+            # 收集所有操作结果，循环中不 yield
+            success_count = 0
+            fail_count = 0
+            fail_details = []
+            result_messages = []  # 收集所有结果消息
+            
+            for idx, (ident, daemon_id, instance_id, instance_name) in enumerate(instances, 1):
+                # 检查冷却
+                if self.cooldown_manager.check_cooldown(instance_id):
+                    result_messages.append(f"⏳ {instance_name} 操作太快了，跳过")
+                    fail_count += 1
+                    fail_details.append(f"{instance_name}: 操作太快")
+                    await asyncio.sleep(self.batch_interval)  # 保持延迟，但不 yield
+                    continue
+                
+                # 执行 API 请求
+                resp = await self.make_mcsm_request(
+                    "/protected_instance/stop",
+                    method="GET",
+                    params={"uuid": instance_id, "daemonId": daemon_id}
+                )
+                
+                if resp.get("status") != 200:
+                    err = resp.get("data") or resp.get("error") or "未知错误"
+                    status_code = resp.get("status", "???")
+                    result_messages.append(f"❌ {instance_name} 停止失败: [{status_code}] {err}")
+                    fail_count += 1
+                    fail_details.append(f"{instance_name}: {err}")
+                else:
+                    self.cooldown_manager.set_cooldown(instance_id)
+                    result_messages.append(f"✅ {instance_name} 停止命令已发送")
+                    success_count += 1
+                
+                # 每个实例处理完后延迟（除了最后一个）
+                if idx < len(instances):
+                    await asyncio.sleep(self.batch_interval)
+            
+            # 循环结束后，一次性发送所有结果
+            # 构建完整的结果消息
+            result_msg = f"📊 批量停止完成: 成功 {success_count} 个，失败 {fail_count} 个\n\n"
+            result_msg += "\n".join(result_messages)
+            
+            if failed_identifiers:
+                result_msg += f"\n\n⚠️ 未找到的标识符: {', '.join(failed_identifiers)}"
+            if fail_details:
+                result_msg += f"\n\n❌ 失败详情:\n" + "\n".join(fail_details)
+            
+            yield event.plain_result(result_msg)
             return
         
         # 单实例操作
-        if not identifier.strip():
+        if not identifiers:
             yield event.plain_result("❌ 请输入有效的实例标识符")
             return
         
+        # 使用第一个标识符（单实例操作）
         async for result in self._process_single_instance(
-            event, identifier.strip(), "🛑", "停止", "/protected_instance/stop"
+            event, identifiers[0], "🛑", "停止", "/protected_instance/stop"
         ):
             yield result
 
