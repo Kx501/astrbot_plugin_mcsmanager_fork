@@ -1,6 +1,6 @@
 name: MCSManager助手
 author: 5060ti个马力的2099、Kx501
 desc: 可以通过指令管理mcsmanager内实例的插件:主要功能:通过指令开/关mcsm实例，mcsm节点状态（内存，cpu占用），查看实例列表
-version: 2.0.25.13
+version: 2.0.25.14
 repo: https://github.com/kx501/astrbot_plugin_mcsmanager_fork
-tags: ["面板"]
+tags: ["面板","管理"]

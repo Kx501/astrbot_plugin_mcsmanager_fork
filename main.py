@@ -5,6 +5,8 @@ import httpx
 import json 
 import datetime 
 import re
+import cn2an
+from natsort import natsorted
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -103,6 +105,33 @@ class MCSMPlugin(Star):
             
         # 否则原样返回
         return raw_id
+
+    def _convert_chinese_numbers_in_string(self, text: str) -> str:
+        """
+        将字符串中的中文数字转换为阿拉伯数字，用于排序
+        例如: "实例九" -> "实例9", "节点十一" -> "节点11"
+        """
+        if not text:
+            return text
+        
+        # 匹配中文数字的正则表达式
+        # 支持: 零一二三四五六七八九十百千万等
+        chinese_number_pattern = r'[零一二三四五六七八九十百千万]+'
+        
+        def replace_chinese_number(match):
+            chinese_num = match.group(0)
+            try:
+                # 使用 cn2an 转换中文数字为阿拉伯数字
+                # 使用 "normal" 模式以支持"一二三"这样的格式
+                arabic_num = cn2an.cn2an(chinese_num, "normal")
+                return str(arabic_num)
+            except (ValueError, KeyError):
+                # 如果转换失败，返回原字符串
+                return chinese_num
+        
+        # 替换字符串中的所有中文数字
+        result = re.sub(chinese_number_pattern, replace_chinese_number, text)
+        return result
 
     async def make_mcsm_request(self, endpoint: str, method: str = "GET", params: dict = None, data: dict = None) -> dict:
         """发送请求到MCSManager API"""
@@ -227,6 +256,10 @@ class MCSMPlugin(Star):
             nodes: List[Dict[str, Any]] = []
             if overview_resp.get("status") == 200:
                 nodes = overview_resp.get("data", {}).get("remote", [])
+                # 按节点名称进行自然排序（支持中文数字）
+                nodes = natsorted(nodes, key=lambda x: self._convert_chinese_numbers_in_string(
+                    x.get("remarks") or x.get("ip") or "Unnamed Node"
+                ))
             
             if not nodes:
                 logger.warning("自动刷新缓存失败: 无法从 /overview 获取节点信息")
@@ -304,8 +337,8 @@ class MCSMPlugin(Star):
                 if not instances:
                     continue
                 
-                # 节点内按名称排序
-                instances.sort(key=lambda x: x['name'])
+                # 节点内按名称自然排序（支持中文数字）
+                instances[:] = natsorted(instances, key=lambda x: self._convert_chinese_numbers_in_string(x['name']))
                 
                 # 构建缓存数据
                 for instance in instances:
@@ -545,8 +578,10 @@ class MCSMPlugin(Star):
 /mcsm list - 节点实例列表 (按名称A-Z排序，提供编号)
 
 > 实例操作 (支持 名称/编号/UUID) ---
-/mcsm start [实例1] [实例2] - 批量启动（空格分隔，所有标识符必须是同一类型）
-/mcsm stop [实例1] [实例2] - 批量停止（空格分隔，所有标识符必须是同一类型）
+/mcsm start [实例1] [实例2] - 批量启动（空格分隔）
+/mcsm stop [实例1] [实例2] - 批量停止（空格分隔）
+/mcsm restart [实例1] [实例2] - 批量重启（空格分隔）
+/mcsm kill [实例1] [实例2] - 批量终止（仅管理员，空格分隔）
 /mcsm cmd [实例] [命令] - 发送命令
 /mcsm log [实例] - 查看最近日志
 
@@ -622,6 +657,10 @@ class MCSMPlugin(Star):
         nodes: List[Dict[str, Any]] = []
         if overview_resp.get("status") == 200:
             nodes = overview_resp.get("data", {}).get("remote", [])
+            # 按节点名称进行自然排序（支持中文数字）
+            nodes = natsorted(nodes, key=lambda x: self._convert_chinese_numbers_in_string(
+                x.get("remarks") or x.get("ip") or "Unnamed Node"
+            ))
         
         if not nodes:
             yield event.plain_result(
@@ -702,6 +741,9 @@ class MCSMPlugin(Star):
         
         current_index = 1
 
+        # 获取是否显示UUID的配置
+        show_uuid = self.config.get("show_uuid", True)
+
         # v10 状态码: -1:未知, 0:停止, 1:停止中, 2:启动中, 3:运行中
         # status_map = {3: "🟢", 0: "🔴", 1: "🟠", 2: "🟡", -1: "⚪"}
         status_map = {3: "✔", 0: "✘", 1: "⚑", 2: "⛟", -1: "☠"}
@@ -716,8 +758,8 @@ class MCSMPlugin(Star):
             result += f"\n⛽ 节点: {node_name}\n"
             result += f"Daemon ID: {node_uuid}\n"
             
-            # 节点内按名称排序
-            instances.sort(key=lambda x: x['name'])
+            # 节点内按名称自然排序（支持中文数字）
+            instances[:] = natsorted(instances, key=lambda x: self._convert_chinese_numbers_in_string(x['name']))
             
             # 显示该节点下的所有实例
             for instance in instances:
@@ -729,8 +771,9 @@ class MCSMPlugin(Star):
                 # 打印实例信息：状态图标 + 编号 + 实例名称
                 ambiguity_tag = " (☢重名)" if is_ambiguous else "" # 添加重名标记
                 result += f"{status_icon} [{current_index}] {inst_name}{ambiguity_tag}\n"
-                # UUID单独一行显示，用缩进表示层级
-                result += f"- {inst_uuid}\n"
+                # UUID单独一行显示，用缩进表示层级（根据配置决定是否显示）
+                if show_uuid:
+                    result += f"- {inst_uuid}\n"
                 
                 # 构建缓存数据
                 instance_data = {
@@ -947,6 +990,192 @@ class MCSMPlugin(Star):
         # 使用第一个标识符（单实例操作）
         async for result in self._process_single_instance(
             event, identifiers[0], "🛑", "停止", "/protected_instance/stop"
+        ):
+            yield result
+
+    @filter.command("mcsm restart")
+    async def mcsm_restart(self, event: AstrMessageEvent, identifier: str):
+        """重启实例 (支持名称/编号/UUID，支持批量操作)"""
+        if not self.is_admin_or_authorized(event):
+            yield event.plain_result("❌ 权限不足")
+            return
+
+        # 从完整消息中提取所有标识符
+        raw_msg = event.message_str.strip()
+        parts = raw_msg.split(maxsplit=2)  # 分割为: ["/mcsm", "restart", "2 3"]
+        
+        if len(parts) < 3:
+            # 没有提供标识符，使用 identifier 参数（向后兼容）
+            identifiers = [identifier.strip()] if identifier.strip() else []
+        else:
+            # 提取所有标识符（支持空格分隔的多个标识符）
+            identifiers = [ident.strip() for ident in parts[2].strip().split() if ident.strip()]
+        
+        # 批量操作
+        if len(identifiers) > 1:
+            instances, failed_identifiers = self._collect_instances_for_batch(identifiers)
+            
+            if instances is None:  # 类型不一致
+                yield event.plain_result(f"❌ 批量操作时所有标识符必须是同一类型（编号/UUID/名称），当前混合使用了不同类型")
+                return
+            
+            if not instances:
+                yield event.plain_result(f"❌ 批量重启失败: 所有标识符都找不到对应的实例")
+                return
+            
+            # 发送开始消息
+            yield event.plain_result(f"🔄 开始批量重启 {len(instances)} 个实例...")
+            await asyncio.sleep(self.batch_interval)
+            
+            # 收集所有操作结果，循环中不 yield
+            success_count = 0
+            fail_count = 0
+            fail_details = []
+            result_messages = []  # 收集所有结果消息
+            
+            for idx, (ident, daemon_id, instance_id, instance_name) in enumerate(instances, 1):
+                # 检查冷却
+                if self.cooldown_manager.check_cooldown(instance_id):
+                    result_messages.append(f"⏳ {instance_name} 操作太快了，跳过")
+                    fail_count += 1
+                    fail_details.append(f"{instance_name}: 操作太快")
+                    await asyncio.sleep(self.batch_interval)  # 保持延迟，但不 yield
+                    continue
+                
+                # 执行 API 请求
+                resp = await self.make_mcsm_request(
+                    "/protected_instance/restart",
+                    method="GET",
+                    params={"uuid": instance_id, "daemonId": daemon_id}
+                )
+                
+                if resp.get("status") != 200:
+                    err = resp.get("data") or resp.get("error") or "未知错误"
+                    status_code = resp.get("status", "???")
+                    result_messages.append(f"❌ {instance_name} 重启失败: [{status_code}] {err}")
+                    fail_count += 1
+                    fail_details.append(f"{instance_name}: {err}")
+                else:
+                    self.cooldown_manager.set_cooldown(instance_id)
+                    result_messages.append(f"✅ {instance_name} 重启命令已发送")
+                    success_count += 1
+                
+                # 每个实例处理完后延迟（除了最后一个）
+                if idx < len(instances):
+                    await asyncio.sleep(self.batch_interval)
+            
+            # 循环结束后，一次性发送所有结果
+            # 构建完整的结果消息
+            result_msg = f"📊 批量重启完成: 成功 {success_count} 个，失败 {fail_count} 个\n\n"
+            result_msg += "\n".join(result_messages)
+            
+            if failed_identifiers:
+                result_msg += f"\n\n⚠️ 未找到的标识符: {', '.join(failed_identifiers)}"
+            if fail_details:
+                result_msg += f"\n\n❌ 失败详情:\n" + "\n".join(fail_details)
+            
+            yield event.plain_result(result_msg)
+            return
+        
+        # 单实例操作
+        if not identifiers:
+            yield event.plain_result("❌ 请输入有效的实例标识符")
+            return
+        
+        # 使用第一个标识符（单实例操作）
+        async for result in self._process_single_instance(
+            event, identifiers[0], "🔄", "重启", "/protected_instance/restart"
+        ):
+            yield result
+
+    @filter.command("mcsm kill", permission_type=filter.PermissionType.ADMIN)
+    async def mcsm_kill(self, event: AstrMessageEvent, identifier: str):
+        """强制终止实例 (仅管理员，支持名称/编号/UUID，支持批量操作)"""
+        # 从完整消息中提取所有标识符
+        raw_msg = event.message_str.strip()
+        parts = raw_msg.split(maxsplit=2)  # 分割为: ["/mcsm", "kill", "2 3"]
+        
+        if len(parts) < 3:
+            # 没有提供标识符，使用 identifier 参数（向后兼容）
+            identifiers = [identifier.strip()] if identifier.strip() else []
+        else:
+            # 提取所有标识符（支持空格分隔的多个标识符）
+            identifiers = [ident.strip() for ident in parts[2].strip().split() if ident.strip()]
+        
+        # 批量操作
+        if len(identifiers) > 1:
+            instances, failed_identifiers = self._collect_instances_for_batch(identifiers)
+            
+            if instances is None:  # 类型不一致
+                yield event.plain_result(f"❌ 批量操作时所有标识符必须是同一类型（编号/UUID/名称），当前混合使用了不同类型")
+                return
+            
+            if not instances:
+                yield event.plain_result(f"❌ 批量终止失败: 所有标识符都找不到对应的实例")
+                return
+            
+            # 发送开始消息
+            yield event.plain_result(f"☠ 开始批量终止 {len(instances)} 个实例...")
+            await asyncio.sleep(self.batch_interval)
+            
+            # 收集所有操作结果，循环中不 yield
+            success_count = 0
+            fail_count = 0
+            fail_details = []
+            result_messages = []  # 收集所有结果消息
+            
+            for idx, (ident, daemon_id, instance_id, instance_name) in enumerate(instances, 1):
+                # 检查冷却
+                if self.cooldown_manager.check_cooldown(instance_id):
+                    result_messages.append(f"⏳ {instance_name} 操作太快了，跳过")
+                    fail_count += 1
+                    fail_details.append(f"{instance_name}: 操作太快")
+                    await asyncio.sleep(self.batch_interval)  # 保持延迟，但不 yield
+                    continue
+                
+                # 执行 API 请求
+                resp = await self.make_mcsm_request(
+                    "/protected_instance/kill",
+                    method="GET",
+                    params={"uuid": instance_id, "daemonId": daemon_id}
+                )
+                
+                if resp.get("status") != 200:
+                    err = resp.get("data") or resp.get("error") or "未知错误"
+                    status_code = resp.get("status", "???")
+                    result_messages.append(f"❌ {instance_name} 终止失败: [{status_code}] {err}")
+                    fail_count += 1
+                    fail_details.append(f"{instance_name}: {err}")
+                else:
+                    self.cooldown_manager.set_cooldown(instance_id)
+                    result_messages.append(f"✅ {instance_name} 终止命令已发送")
+                    success_count += 1
+                
+                # 每个实例处理完后延迟（除了最后一个）
+                if idx < len(instances):
+                    await asyncio.sleep(self.batch_interval)
+            
+            # 循环结束后，一次性发送所有结果
+            # 构建完整的结果消息
+            result_msg = f"📊 批量终止完成: 成功 {success_count} 个，失败 {fail_count} 个\n\n"
+            result_msg += "\n".join(result_messages)
+            
+            if failed_identifiers:
+                result_msg += f"\n\n⚠️ 未找到的标识符: {', '.join(failed_identifiers)}"
+            if fail_details:
+                result_msg += f"\n\n❌ 失败详情:\n" + "\n".join(fail_details)
+            
+            yield event.plain_result(result_msg)
+            return
+        
+        # 单实例操作
+        if not identifiers:
+            yield event.plain_result("❌ 请输入有效的实例标识符")
+            return
+        
+        # 使用第一个标识符（单实例操作）
+        async for result in self._process_single_instance(
+            event, identifiers[0], "☠", "终止", "/protected_instance/kill"
         ):
             yield result
 

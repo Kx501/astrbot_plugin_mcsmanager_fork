@@ -35,6 +35,12 @@
     "hint": "只显示包含任意关键词的实例（白名单模式），不配置时显示所有实例",
     "default": []
   },
+  "show_uuid": {
+    "description": "是否在查询列表时显示实例UUID",
+    "type": "bool",
+    "hint": "设置为false时，mcsm list将不显示实例UUID",
+    "default": true
+  },
   "batch_operation_interval": {
     "description": "批量操作间隔时间（秒）",
     "type": "float",
