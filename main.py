@@ -106,32 +106,35 @@ class MCSMPlugin(Star):
         # 否则原样返回
         return raw_id
 
-    def _convert_chinese_numbers_in_string(self, text: str) -> str:
+    def _get_sort_key(self, text: str) -> Tuple[int, str]:
         """
-        将字符串中的中文数字转换为阿拉伯数字，用于排序
-        例如: "实例九" -> "实例9", "节点十一" -> "节点11"
+        生成排序键，用于分开排序阿拉伯数字和中文数字
+        返回: (是否包含中文数字, 转换后的字符串)
+        0 = 无中文数字（排在前面）
+        1 = 有中文数字（排在后面）
         """
         if not text:
-            return text
+            return (0, text)
         
         # 匹配中文数字的正则表达式
-        # 支持: 零一二三四五六七八九十百千万等
         chinese_number_pattern = r'[零一二三四五六七八九十百千万]+'
         
+        # 检查是否包含中文数字
+        has_chinese_number = bool(re.search(chinese_number_pattern, text))
+        
+        # 转换中文数字为阿拉伯数字
         def replace_chinese_number(match):
             chinese_num = match.group(0)
             try:
-                # 使用 cn2an 转换中文数字为阿拉伯数字
-                # 使用 "normal" 模式以支持"一二三"这样的格式
                 arabic_num = cn2an.cn2an(chinese_num, "normal")
                 return str(arabic_num)
             except (ValueError, KeyError):
-                # 如果转换失败，返回原字符串
                 return chinese_num
         
-        # 替换字符串中的所有中文数字
-        result = re.sub(chinese_number_pattern, replace_chinese_number, text)
-        return result
+        converted_text = re.sub(chinese_number_pattern, replace_chinese_number, text)
+        
+        # 返回 (是否包含中文数字, 转换后的字符串)
+        return (1 if has_chinese_number else 0, converted_text)
 
     async def make_mcsm_request(self, endpoint: str, method: str = "GET", params: dict = None, data: dict = None) -> dict:
         """发送请求到MCSManager API"""
@@ -256,8 +259,8 @@ class MCSMPlugin(Star):
             nodes: List[Dict[str, Any]] = []
             if overview_resp.get("status") == 200:
                 nodes = overview_resp.get("data", {}).get("remote", [])
-                # 按节点名称进行自然排序（支持中文数字）
-                nodes = natsorted(nodes, key=lambda x: self._convert_chinese_numbers_in_string(
+                # 按节点名称进行自然排序（支持中文数字，分开排序）
+                nodes = natsorted(nodes, key=lambda x: self._get_sort_key(
                     x.get("remarks") or x.get("ip") or "Unnamed Node"
                 ))
             
@@ -337,8 +340,8 @@ class MCSMPlugin(Star):
                 if not instances:
                     continue
                 
-                # 节点内按名称自然排序（支持中文数字）
-                instances[:] = natsorted(instances, key=lambda x: self._convert_chinese_numbers_in_string(x['name']))
+                # 节点内按名称自然排序（支持中文数字，分开排序）
+                instances[:] = natsorted(instances, key=lambda x: self._get_sort_key(x['name']))
                 
                 # 构建缓存数据
                 for instance in instances:
@@ -657,8 +660,8 @@ class MCSMPlugin(Star):
         nodes: List[Dict[str, Any]] = []
         if overview_resp.get("status") == 200:
             nodes = overview_resp.get("data", {}).get("remote", [])
-            # 按节点名称进行自然排序（支持中文数字）
-            nodes = natsorted(nodes, key=lambda x: self._convert_chinese_numbers_in_string(
+            # 按节点名称进行自然排序（支持中文数字，分开排序）
+            nodes = natsorted(nodes, key=lambda x: self._get_sort_key(
                 x.get("remarks") or x.get("ip") or "Unnamed Node"
             ))
         
@@ -758,8 +761,8 @@ class MCSMPlugin(Star):
             result += f"\n⛽ 节点: {node_name}\n"
             result += f"Daemon ID: {node_uuid}\n"
             
-            # 节点内按名称自然排序（支持中文数字）
-            instances[:] = natsorted(instances, key=lambda x: self._convert_chinese_numbers_in_string(x['name']))
+            # 节点内按名称自然排序（支持中文数字，分开排序）
+            instances[:] = natsorted(instances, key=lambda x: self._get_sort_key(x['name']))
             
             # 显示该节点下的所有实例
             for instance in instances:
