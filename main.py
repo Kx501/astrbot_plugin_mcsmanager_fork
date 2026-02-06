@@ -53,7 +53,7 @@ def format_uptime_seconds(seconds: float) -> str:
     return "".join(parts[:2]) if len(parts) > 1 else "".join(parts)
 
 
-@register("MCSManager", "5060的3600马力", "MCSManager服务器管理插件", "2.0.25.12WNMCNXM") 
+@register("MCSManager", "5060的3600马力、Kx501", "MCSManager服务器管理插件", "2.0.25.15") 
 class MCSMPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -187,34 +187,35 @@ class MCSMPlugin(Star):
             logger.error(f"MCSM API请求失败: {str(e)}")
             return {"status": 500, "error": str(e)}
 
-    def is_admin_or_authorized(self, event: AstrMessageEvent) -> bool:
-        """检查用户权限"""
-        # 管理员始终有权限
-        if event.is_admin():
+    def _command_requires_authorized(self, subcommand: str) -> bool:
+        """判断该子指令是否要求授权用户身份（以配置 authorized_only_commands 为准）"""
+        commands = self.config.get("authorized_only_commands", [])
+        return subcommand in commands
+
+    def _check_authorized_for_command(self, event: AstrMessageEvent, subcommand: str) -> bool:
+        """该子指令允许当前用户执行则返回 True，否则 False"""
+        if not self._command_requires_authorized(subcommand):
             return True
-        
-        # 获取配置的授权列表
+        return self.is_admin_or_authorized(event)
+
+    def is_admin_or_authorized(self, event: AstrMessageEvent) -> bool:
+        """检查是否为授权用户（仅依据本插件配置的授权用户/群组，不区分机器人管理员）"""
         authorized_groups = self.config.get("authorized_groups", [])
         authorized_users = self.config.get("authorized_users", [])
-        
-        # 如果两个列表都为空，默认所有人有权限
+
         if not authorized_groups and not authorized_users:
             return True
-        
-        # 白名单模式：先检查群组，再检查用户
-        # 检查群组（如果配置了群组列表）
+
         if authorized_groups:
             group_id = event.message_obj.group_id if hasattr(event, 'message_obj') and hasattr(event.message_obj, 'group_id') else ""
             if group_id and group_id in authorized_groups:
                 return True
-        
-        # 检查用户（如果配置了用户列表）
+
         if authorized_users:
             user_id = str(event.get_sender_id())
             if user_id in authorized_users:
                 return True
-        
-        # 都不满足，拒绝访问
+
         return False
 
     def _should_filter_instance(self, instance_name: str) -> bool:
@@ -462,63 +463,6 @@ class MCSMPlugin(Star):
         
         return instances, failed_identifiers
 
-    async def _process_batch_operation(
-        self,
-        event: AstrMessageEvent,
-        instances: List[Tuple[str, str, str, str]],  # (ident, daemon_id, instance_id, instance_name)
-        operation_emoji: str,  # "🚀" 或 "🛑"
-        operation_name: str,  # "启动" 或 "停止"
-        api_endpoint: str,  # "/protected_instance/open" 或 "/protected_instance/stop"
-        failed_identifiers: List[str]
-    ):
-        """批量操作的通用处理逻辑"""
-        # 显示开始信息
-        yield event.plain_result(f"{operation_emoji} 开始批量{operation_name} {len(instances)} 个实例...")
-        await asyncio.sleep(2)
-        
-        success_count = 0
-        fail_count = 0
-        fail_details = []
-        
-        for ident, daemon_id, instance_id, instance_name in instances:
-            # 检查冷却
-            if self.cooldown_manager.check_cooldown(instance_id):
-                yield event.plain_result(f"⏳ {instance_name} 操作太快了，跳过")
-                await asyncio.sleep(2)
-                fail_count += 1
-                fail_details.append(f"{instance_name}: 操作太快")
-                continue
-            
-            yield event.plain_result(f"{operation_emoji} 正在{operation_name}: {instance_name} ...")
-            await asyncio.sleep(2)
-            
-            resp = await self.make_mcsm_request(
-                api_endpoint,
-                method="GET",
-                params={"uuid": instance_id, "daemonId": daemon_id}
-            )
-            
-            if resp.get("status") != 200:
-                err = resp.get("data") or resp.get("error") or "未知错误"
-                status_code = resp.get("status", "???")
-                yield event.plain_result(f"❌ {instance_name} {operation_name}失败: [{status_code}] {err}")
-                await asyncio.sleep(2)
-                fail_count += 1
-                fail_details.append(f"{instance_name}: {err}")
-            else:
-                self.cooldown_manager.set_cooldown(instance_id)
-                yield event.plain_result(f"✅ {instance_name} {operation_name}命令已发送")
-                await asyncio.sleep(2)
-                success_count += 1
-        
-        # 汇总结果
-        result_msg = f"📊 批量{operation_name}完成: 成功 {success_count} 个，失败 {fail_count} 个"
-        if failed_identifiers:
-            result_msg += f"\n⚠️ 未找到的标识符: {', '.join(failed_identifiers)}"
-        if fail_details:
-            result_msg += f"\n❌ 失败详情:\n" + "\n".join(fail_details)
-        yield event.plain_result(result_msg)
-
     async def _process_single_instance(
         self,
         event: AstrMessageEvent,
@@ -569,35 +513,34 @@ class MCSMPlugin(Star):
     @filter.command("mcsm help")
     async def mcsm_main(self, event: AstrMessageEvent):
         """显示帮助信息"""
-        if not self.is_admin_or_authorized(event):
-            # 无权限只返回一个基本的提示
-            yield event.plain_result("❌ 权限不足。请联系管理员获取授权。")
+        if not self._check_authorized_for_command(event, "help"):
+            yield event.plain_result("❌ 权限不足")
             return
             
         help_text = """
 🛠️ MCSM面板 管理指令：
 /mcsm help - 显示此帮助
 /mcsm status - 面板状态概览
-/mcsm list - 节点实例列表 (按名称A-Z排序，提供编号)
+/mcsm list - 节点实例列表 (按名称排序，提供编号)
+/mcsm op <qq/@> - 授权用户插件管理员身份
+/mcsm deop <qq/@> - 取消用户插件管理员身份
 
 > 实例操作 (支持 名称/编号/UUID) ---
-/mcsm start [实例1] [实例2] - 批量启动（空格分隔）
-/mcsm stop [实例1] [实例2] - 批量停止（空格分隔）
-/mcsm restart [实例1] [实例2] - 批量重启（空格分隔）
-/mcsm kill [实例1] [实例2] - 批量终止（仅管理员，空格分隔）
-/mcsm cmd [实例] [命令] - 发送命令
-/mcsm log [实例] - 查看最近日志
-
-> 权限管理 (仅管理员)
-/mcsm op - 授权用户
-/mcsm deop - 取消用户授权
+/mcsm start <实例1> [实例2] - 批量启动
+/mcsm stop <实例1> [实例2] - 批量停止
+/mcsm restart <实例1> [实例2] - 批量重启
+/mcsm kill <实例1> [实例2] - 批量终止
+/mcsm cmd <实例> [命令] - 发送命令
+/mcsm log <实例> - 查看最近日志
 """
         yield event.plain_result(help_text)
 
-    @filter.command("mcsm op", permission_type=filter.PermissionType.ADMIN)
+    @filter.command("mcsm op")
     async def mcsm_auth(self, event: AstrMessageEvent, user_id: str):
         """授权用户"""
-        # 提取用户 ID
+        if not self._check_authorized_for_command(event, "op"):
+            yield event.plain_result("❌ 权限不足")
+            return
         user_id = self._extract_user_id(user_id) 
         
         if not user_id.isdigit():
@@ -620,10 +563,12 @@ class MCSMPlugin(Star):
         except Exception as e:
              yield event.plain_result(f"❌ 授权失败 (保存配置异常): {str(e)}")
 
-    @filter.command("mcsm deop", permission_type=filter.PermissionType.ADMIN)
+    @filter.command("mcsm deop")
     async def mcsm_unauth(self, event: AstrMessageEvent, user_id: str):
         """取消用户授权"""
-        # 提取用户 ID
+        if not self._check_authorized_for_command(event, "deop"):
+            yield event.plain_result("❌ 权限不足")
+            return
         user_id = self._extract_user_id(user_id)
 
         if not user_id.isdigit():
@@ -649,10 +594,9 @@ class MCSMPlugin(Star):
     @filter.command("mcsm list")
     async def mcsm_list(self, event: AstrMessageEvent):
         """查看实例列表"""
-        if not self.is_admin_or_authorized(event):
+        if not self._check_authorized_for_command(event, "list"):
             yield event.plain_result("❌ 权限不足")
             return
-
         yield event.plain_result("正在获取节点和实例数据，请稍候...")
 
         overview_resp = await self.make_mcsm_request("/overview")
@@ -809,10 +753,9 @@ class MCSMPlugin(Star):
     @filter.command("mcsm start")
     async def mcsm_start(self, event: AstrMessageEvent, identifier: str):
         """启动实例 (支持名称/编号/UUID，支持批量操作)"""
-        if not self.is_admin_or_authorized(event):
+        if not self._check_authorized_for_command(event, "start"):
             yield event.plain_result("❌ 权限不足")
             return
-
         # 从完整消息中提取所有标识符
         raw_msg = event.message_str.strip()
         parts = raw_msg.split(maxsplit=2)  # 分割为: ["/mcsm", "start", "2 3"]
@@ -904,10 +847,9 @@ class MCSMPlugin(Star):
     @filter.command("mcsm stop")
     async def mcsm_stop(self, event: AstrMessageEvent, identifier: str):
         """停止实例 (支持名称/编号/UUID，支持批量操作)"""
-        if not self.is_admin_or_authorized(event):
+        if not self._check_authorized_for_command(event, "stop"):
             yield event.plain_result("❌ 权限不足")
             return
-
         # 从完整消息中提取所有标识符
         raw_msg = event.message_str.strip()
         parts = raw_msg.split(maxsplit=2)  # 分割为: ["/mcsm", "stop", "2 3"]
@@ -999,10 +941,9 @@ class MCSMPlugin(Star):
     @filter.command("mcsm restart")
     async def mcsm_restart(self, event: AstrMessageEvent, identifier: str):
         """重启实例 (支持名称/编号/UUID，支持批量操作)"""
-        if not self.is_admin_or_authorized(event):
+        if not self._check_authorized_for_command(event, "restart"):
             yield event.plain_result("❌ 权限不足")
             return
-
         # 从完整消息中提取所有标识符
         raw_msg = event.message_str.strip()
         parts = raw_msg.split(maxsplit=2)  # 分割为: ["/mcsm", "restart", "2 3"]
@@ -1091,9 +1032,12 @@ class MCSMPlugin(Star):
         ):
             yield result
 
-    @filter.command("mcsm kill", permission_type=filter.PermissionType.ADMIN)
+    @filter.command("mcsm kill")
     async def mcsm_kill(self, event: AstrMessageEvent, identifier: str):
-        """强制终止实例 (仅管理员，支持名称/编号/UUID，支持批量操作)"""
+        """强制终止实例 (支持名称/编号/UUID，支持批量操作)"""
+        if not self._check_authorized_for_command(event, "kill"):
+            yield event.plain_result("❌ 权限不足")
+            return
         # 从完整消息中提取所有标识符
         raw_msg = event.message_str.strip()
         parts = raw_msg.split(maxsplit=2)  # 分割为: ["/mcsm", "kill", "2 3"]
@@ -1185,10 +1129,9 @@ class MCSMPlugin(Star):
     @filter.command("mcsm cmd")
     async def mcsm_cmd(self, event: AstrMessageEvent, identifier: str):
         """发送命令 (支持名称/编号/UUID)"""
-        if not self.is_admin_or_authorized(event):
+        if not self._check_authorized_for_command(event, "cmd"):
             yield event.plain_result("❌ 权限不足")
             return
-
         raw_msg = event.message_str.strip()
         parts = raw_msg.split(maxsplit=3)
         
@@ -1261,10 +1204,9 @@ class MCSMPlugin(Star):
     @filter.command("mcsm log")
     async def mcsm_log(self, event: AstrMessageEvent, identifier: str):
         """查看最近日志 (支持名称/编号/UUID)"""
-        if not self.is_admin_or_authorized(event):
+        if not self._check_authorized_for_command(event, "log"):
             yield event.plain_result("❌ 权限不足")
             return
-
         ids = self._get_instance_by_identifier(identifier)
         if not ids:
             if identifier in self.instance_data.get("ambiguous_names", set()):
@@ -1311,10 +1253,9 @@ class MCSMPlugin(Star):
     @filter.command("mcsm status")
     async def mcsm_status(self, event: AstrMessageEvent):
         """查看面板状态"""
-        if not self.is_admin_or_authorized(event):
+        if not self._check_authorized_for_command(event, "status"):
             yield event.plain_result("❌ 权限不足")
             return
-
         def format_memory_gb(bytes_value):
             if not isinstance(bytes_value, (int, float)) or bytes_value <= 0:
                 return "0.00 GB"
@@ -1328,17 +1269,15 @@ class MCSMPlugin(Star):
             return
 
         data = overview_resp.get("data", {})
-        
-        r_count = data.get("remoteCount", {})
-        r_avail = r_count.get('available', 0) if isinstance(r_count, dict) else 0
-        r_total = r_count.get('total', 0) if isinstance(r_count, dict) else 0
+        filtered_nodes = self.config.get("filtered_nodes", [])
 
         total_instances = 0
         running_instances = 0
-        
+        visible_node_count = 0
+        visible_node_avail = 0
+
         mcsm_version = data.get("version", "未知版本")
-        
-        # --- 1. 提取并格式化根层级的 time 字段 (数据时间点)
+
         panel_timestamp_ms = overview_resp.get("time")
         panel_time_formatted = "未知时间"
         if panel_timestamp_ms and isinstance(panel_timestamp_ms, (int, float)):
@@ -1350,43 +1289,38 @@ class MCSMPlugin(Star):
 
         os_system_uptime = data.get("system", {}).get("uptime")
         os_uptime_formatted = format_uptime_seconds(os_system_uptime)
-        
         logger.info(f"OS/Server raw uptime (from panel system): {os_system_uptime} seconds")
-
 
         status_text = (
             f"📊 MCSM v{mcsm_version} 状态概览:\n"
             f"  - 数据时间: {panel_time_formatted}\n"
             "----------------------\n"
         )
-        
+
         if "remote" in data:
             for i, node in enumerate(data["remote"]):
+                node_uuid = node.get("uuid")
+                if node_uuid in filtered_nodes:
+                    continue
+                visible_node_count += 1
+                if node.get("available"):
+                    visible_node_avail += 1
                 node_sys = node.get("system", {})
                 inst_info = node.get("instance", {})
-                
                 total_instances += inst_info.get("total", 0)
                 running_instances += inst_info.get("running", 0)
 
                 node_name = node.get("remarks") or node.get("hostname") or f"Unnamed Node ({i+1})"
                 node_version = node.get("version", "未知")
-                
                 os_version = node_sys.get("version") or node_sys.get("release") or "未知"
-                
-                # CPU 占用喵
-                node_cpu_percent = f"{(node_sys.get('cpuUsage', 0) * 100):.2f}%" 
-                
-                # 内存占用喵
+                node_cpu_percent = f"{(node_sys.get('cpuUsage', 0) * 100):.2f}%"
                 mem_total_bytes = node_sys.get("totalmem", 0)
                 mem_usage_ratio = node_sys.get("memUsage", 0)
                 mem_used_bytes = mem_total_bytes * mem_usage_ratio
-                
                 mem_used_formatted = format_memory_gb(mem_used_bytes)
                 mem_total_formatted = format_memory_gb(mem_total_bytes)
-                
                 inst_running = inst_info.get("running", 0)
                 inst_total = inst_info.get("total", 0)
-
 
                 status_text += (
                     f"🖥️ 节点: {node_name}\n"
@@ -1400,8 +1334,8 @@ class MCSMPlugin(Star):
                 )
 
         status_text += (
-            f"- 在线时间: {os_uptime_formatted}\n" 
-            f"总节点状态: {r_avail} 在线 / {r_total} 总数\n"
+            f"- 在线时间: {os_uptime_formatted}\n"
+            f"总节点状态: {visible_node_avail} 在线 / {visible_node_count} 总数\n"
             f"实例运行状态: {running_instances} / {total_instances}\n"
             f"提示: 使用 /mcsm list 查看详情"
         )
